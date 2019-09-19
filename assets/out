@@ -1,0 +1,80 @@
+#!/bin/bash
+
+set -e
+exec 3>&1
+exec 1>&2
+
+# write stdin json to a file
+INPUT='/tmp/input'
+cat > "$INPUT" <&0
+
+REPO_DIR=$(jq -r '.source.repo_path // ""' < $INPUT)
+REDIS_HOST=$(jq -r '.source.redis_host // ""' < $INPUT)
+for v in REPO_DIR REDIS_HOST
+do
+if [[ -z "${!v}" ]] 
+   then
+     echo "${!v} is not specified"
+     exit 1
+fi
+done
+# echo $REPO_DIR >&2
+# echo $BUILD_ID >&2
+# echo $BUILD_JOB_NAME >&2
+# echo $BUILD_PIPELINE_NAME >&2
+# echo $BUILD_TEAM_NAME >&2
+
+TAG_FILE=tag
+SEMVER2_REGEX='^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(-(0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(\.(0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*)?(\+[0-9a-zA-Z-]+(\.[0-9a-zA-Z-]+)*)?$'
+BRANCH_REGEX='^(feature|bugfix|hotfix|release)/(.*)$'
+
+sha_short_commit() {
+  COMMIT_SHORT_SHA=$(git rev-parse HEAD | cut -c1-10)
+  export COMMIT_SHORT_SHA
+}
+
+branch() {
+  BRANCH=$(git name-rev --name-only HEAD)
+  export BRANCH
+}
+
+branch_tag_part() {
+   BRANCH_TAG_PART=$(git name-rev --name-only HEAD | awk -F '/' '{print $2}')
+   export $BRANCH_TAG_PART
+}
+
+# $1 - redis_host $2 - redis_key $3 - redis_value
+set_redis() {
+  result=$(redis-cli -h $1 set $2 $3)
+  if [ "${result}" != "OK" ]
+  then
+    echo "can't save tag in redis" >&2
+    exit 1
+  fi
+}
+
+cd /tmp/build/put/$REPO_DIR
+# check for tag on HEAD
+sha_short_commit
+TAG=$(git tag -l --points-at HEAD)
+if [ ! -z "$TAG" ]; then
+# if tag match semver2
+   if [[ $TAG =~ $SEMVER2_REGEX ]]; then
+      DOCKER_TAG="${TAG}-${COMMIT_SHORT_SHA}"
+   else
+      DOCKER_TAG="dirty_tag-${COMMIT_SHORT_SHA}"
+   fi
+else
+   branch
+   if [[ $BRANCH =~ $BRANCH_REGEX ]]; then
+      branch_tag_part
+      DOCKER_TAG="${BRANCH_TAG_PART}-${COMMIT_SHORT_SHA}"
+   else
+      DOCKER_TAG="${BRANCH}-${COMMIT_SHORT_SHA}"
+   fi
+fi
+
+echo $DOCKER_TAG >&2
+set_redis $REDIS_HOST $BUILD_TEAM_NAME:$BUILD_PIPELINE_NAME:$BUILD_ID $DOCKER_TAG
+
+echo "{\"version\":{\"ref\":\"$BUILD_TEAM_NAME:$BUILD_PIPELINE_NAME:$BUILD_ID\"}}" >&3
